@@ -5,6 +5,7 @@ import {
     MarkdownRenderer,
     Component,
     setIcon,
+    Notice,
 } from "obsidian";
 import type { KanbanData, KanbanItem, KanbanTag, KanbanProject, KanbanCustomView } from "./types";
 import { parseMarkdown, serializeMarkdown } from "./parser";
@@ -62,10 +63,90 @@ export class KanbanView extends ItemView {
         this.addAction("file-text", "Open as Markdown", () => {
             void this.switchToMarkdown();
         });
+
+        // Register undo/redo keydown listener
+        this.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
+            if (this.app.workspace.getActiveViewOfType(KanbanView) !== this) return;
+
+            const isMod = e.ctrlKey || e.metaKey;
+            if (isMod && e.key.toLowerCase() === "z") {
+                const activeTag = document.activeElement?.tagName.toLowerCase();
+                if (activeTag === "input" || activeTag === "textarea") {
+                    return;
+                }
+
+                e.preventDefault();
+                if (e.shiftKey) {
+                    this.redo();
+                } else {
+                    this.undo();
+                }
+            } else if (isMod && e.key.toLowerCase() === "y") {
+                const activeTag = document.activeElement?.tagName.toLowerCase();
+                if (activeTag === "input" || activeTag === "textarea") {
+                    return;
+                }
+                e.preventDefault();
+                this.redo();
+            }
+        });
     }
 
     async onClose(): Promise<void> {
         this.contentEl.empty();
+    }
+
+    private undoStack: string[] = [];
+    private redoStack: string[] = [];
+
+    pushHistoryState(): void {
+        if (!this.data) return;
+        const state = serializeMarkdown(this.data);
+        if (this.undoStack.length === 0 || this.undoStack[this.undoStack.length - 1] !== state) {
+            this.undoStack.push(state);
+            if (this.undoStack.length > 50) {
+                this.undoStack.shift();
+            }
+            this.redoStack = []; // Clear redo stack on new action
+        }
+    }
+
+    undo(): void {
+        const previousState = this.undoStack.pop();
+        if (!previousState) {
+            new Notice("Nothing to undo");
+            return;
+        }
+
+        const currentState = serializeMarkdown(this.data);
+        this.redoStack.push(currentState);
+        if (this.redoStack.length > 50) {
+            this.redoStack.shift();
+        }
+
+        this.data = parseMarkdown(previousState);
+        this.debouncedSave();
+        void this.render();
+        new Notice("Undo action");
+    }
+
+    redo(): void {
+        const nextState = this.redoStack.pop();
+        if (!nextState) {
+            new Notice("Nothing to redo");
+            return;
+        }
+
+        const currentState = serializeMarkdown(this.data);
+        this.undoStack.push(currentState);
+        if (this.undoStack.length > 50) {
+            this.undoStack.shift();
+        }
+
+        this.data = parseMarkdown(nextState);
+        this.debouncedSave();
+        void this.render();
+        new Notice("Redo action");
     }
 
     async loadFile(file: TFile): Promise<void> {
@@ -76,6 +157,21 @@ export class KanbanView extends ItemView {
     }
 
     async render(): Promise<void> {
+        // Capture scroll positions before wiping the DOM
+        let horizontalScroll = 0;
+        const scrollPositions = new Map<string, number>();
+        if (this.columnsEl) {
+            horizontalScroll = this.columnsEl.scrollLeft;
+            const columns = this.columnsEl.querySelectorAll(".kanban-column");
+            columns.forEach((col) => {
+                const colId = col.getAttr("data-column-id");
+                const itemsEl = col.querySelector(".kanban-items");
+                if (colId && itemsEl) {
+                    scrollPositions.set(colId, itemsEl.scrollTop);
+                }
+            });
+        }
+
         // Close any open sidebar before wiping the DOM
         this.closeItemSidebar();
 
@@ -119,6 +215,39 @@ export class KanbanView extends ItemView {
         // Columns container
         this.columnsEl = container.createDiv("kanban-columns");
         this.renderColumns();
+
+        // Restore horizontal scroll
+        if (horizontalScroll > 0) {
+            this.columnsEl.scrollLeft = horizontalScroll;
+        }
+
+        // Restore vertical scroll for each column
+        if (scrollPositions.size > 0) {
+            const restoreVerticalScrolls = () => {
+                if (!this.columnsEl) return;
+                const columns = this.columnsEl.querySelectorAll(".kanban-column");
+                columns.forEach((col) => {
+                    const colId = col.getAttr("data-column-id");
+                    if (colId) {
+                        const scrollPos = scrollPositions.get(colId);
+                        if (scrollPos !== undefined) {
+                            const itemsEl = col.querySelector(".kanban-items");
+                            if (itemsEl) {
+                                itemsEl.scrollTop = scrollPos;
+                            }
+                        }
+                    }
+                });
+            };
+
+            // Restore immediately
+            restoreVerticalScrolls();
+
+            // Also restore on next frame to account for async markdown rendering / layout shifts
+            requestAnimationFrame(() => {
+                restoreVerticalScrolls();
+            });
+        }
     }
 
     private renderColumns(): void {
@@ -198,6 +327,7 @@ export class KanbanView extends ItemView {
             const targetIdx = this.data.columns.findIndex((c) => c.id === column.id);
             if (sourceIdx === -1 || targetIdx === -1) return;
 
+            this.pushHistoryState();
             // Reorder: remove source and insert at target position
             const [sourceCol] = this.data.columns.splice(sourceIdx, 1);
             this.data.columns.splice(targetIdx, 0, sourceCol!);
@@ -317,6 +447,8 @@ export class KanbanView extends ItemView {
 
             const itemIdx = srcCol.items.findIndex((i) => i.id === itemId);
             if (itemIdx === -1) return;
+
+            this.pushHistoryState();
             const [movedItem] = srcCol.items.splice(itemIdx, 1);
             if (!movedItem) return;
 
@@ -399,6 +531,7 @@ export class KanbanView extends ItemView {
         });
         setIcon(deleteBtn, "x");
         deleteBtn.addEventListener("click", () => {
+            this.pushHistoryState();
             column.items = column.items.filter((i) => i.id !== item.id);
             this.debouncedSave();
             void this.render();
@@ -526,6 +659,7 @@ export class KanbanView extends ItemView {
         });
         titleEl.addEventListener("click", () => {
             this.startInlineEdit(titleEl, item.content, (newContent) => {
+                this.pushHistoryState();
                 item.content = newContent;
                 this.debouncedSave();
                 void this.render();
@@ -565,6 +699,7 @@ export class KanbanView extends ItemView {
                     setIcon(rmBtn, "x");
                     rmBtn.addEventListener("click", (e) => {
                         e.stopPropagation();
+                        this.pushHistoryState();
                         item.tags = item.tags.filter((t) => t !== tagId);
                         this.debouncedSave();
                         void this.render();
@@ -598,6 +733,7 @@ export class KanbanView extends ItemView {
                     setIcon(rmBtn, "x");
                     rmBtn.addEventListener("click", async (e) => {
                         e.stopPropagation();
+                        this.pushHistoryState();
                         item.project = undefined;
                         await this.handleTaskFileMove(item);
                         await this.updateLinkedTaskFileMetadata(item);
@@ -635,6 +771,7 @@ export class KanbanView extends ItemView {
                 
                 pill.addEventListener("click", async () => {
                     if (item.priority === p) return;
+                    this.pushHistoryState();
                     item.priority = p;
                     await this.updateLinkedTaskFileMetadata(item);
                     this.debouncedSave();
@@ -991,6 +1128,7 @@ export class KanbanView extends ItemView {
         editTitleOpt.addEventListener("click", () => {
             menu.remove();
             this.startInlineEdit(nameEl, column.name, (newName) => {
+                this.pushHistoryState();
                 column.name = newName;
                 column.id = newName.toLowerCase().replace(/\s+/g, "-");
                 this.debouncedSave();
@@ -1002,6 +1140,7 @@ export class KanbanView extends ItemView {
         if (isDone) {
             markDoneOpt.createSpan({ text: "Unmark as Done" });
             markDoneOpt.addEventListener("click", () => {
+                this.pushHistoryState();
                 this.data.doneColumnId = null;
                 this.debouncedSave();
                 menu.remove();
@@ -1010,6 +1149,7 @@ export class KanbanView extends ItemView {
         } else {
             markDoneOpt.createSpan({ text: "Mark as Done" });
             markDoneOpt.addEventListener("click", () => {
+                this.pushHistoryState();
                 this.data.doneColumnId = column.id;
                 this.debouncedSave();
                 menu.remove();
@@ -1137,6 +1277,8 @@ export class KanbanView extends ItemView {
         const column = this.data.columns.find((c) => c.id === columnId);
         if (!column) return;
 
+        this.pushHistoryState();
+
         // Auto-assign project if exactly one project is selected in the project filters
         let assignedProject: string | undefined = undefined;
         if (this.filterProjects.length === 1) {
@@ -1196,6 +1338,7 @@ export class KanbanView extends ItemView {
     }
 
     private addColumn(): void {
+        this.pushHistoryState();
         const name = `Column ${this.data.columns.length + 1}`;
         this.data.columns.push({
             id: name.toLowerCase().replace(/\s+/g, "-"),
@@ -1207,6 +1350,15 @@ export class KanbanView extends ItemView {
     }
 
     private deleteColumn(columnId: string): void {
+        const column = this.data.columns.find((c) => c.id === columnId);
+        if (!column) return;
+
+        const confirmDelete = confirm(
+            `Are you sure you want to delete the column "${column.name}" and all of its ${column.items.length} items? This action can be undone using Ctrl+Z.`
+        );
+        if (!confirmDelete) return;
+
+        this.pushHistoryState();
         this.data.columns = this.data.columns.filter((c) => c.id !== columnId);
         this.debouncedSave();
         void this.render();
