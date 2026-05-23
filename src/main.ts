@@ -10,7 +10,7 @@ export default class TimizuoKanbanPlugin extends Plugin {
 
         this.registerView(
             VIEW_TYPE_KANBAN,
-            (leaf) => new KanbanView(leaf)
+            (leaf) => new KanbanView(leaf, this)
         );
 
         // Ribbon icon: create new kanban board

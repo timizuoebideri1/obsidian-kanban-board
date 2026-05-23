@@ -16,6 +16,7 @@ export interface KanbanItem {
     description?: string;
     tags: string[];
     project?: string; // project id
+    priority?: "low" | "medium" | "high" | "urgent";
     createdAt: number;
 }
 
@@ -39,4 +40,5 @@ export interface KanbanData {
     projects: KanbanProject[];
     doneColumnId: string | null;
     customViews?: KanbanCustomView[];
+    collapsedColumnIds?: string[];
 }

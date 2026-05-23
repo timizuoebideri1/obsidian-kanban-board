@@ -6,6 +6,7 @@ const TAGS_KEY = "kanban-tags";
 const PROJECTS_KEY = "kanban-projects";
 const VIEWS_KEY = "kanban-views";
 const DONE_COLUMN_KEY = "done-column";
+const COLLAPSED_COLUMNS_KEY = "collapsed-columns";
 
 export function parseMarkdown(content: string): KanbanData {
     const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -13,6 +14,7 @@ export function parseMarkdown(content: string): KanbanData {
     let projects: KanbanProject[] = [];
     let customViews: KanbanCustomView[] = [];
     let doneColumnId: string | null = null;
+    let collapsedColumnIds: string[] = [];
 
     if (frontmatterMatch) {
         try {
@@ -55,6 +57,12 @@ export function parseMarkdown(content: string): KanbanData {
             if (typeof fm[DONE_COLUMN_KEY] === "string") {
                 doneColumnId = fm[DONE_COLUMN_KEY] as string;
             }
+            const rawCollapsed = fm[COLLAPSED_COLUMNS_KEY];
+            if (Array.isArray(rawCollapsed)) {
+                collapsedColumnIds = rawCollapsed.map(String);
+            } else if (typeof rawCollapsed === "string") {
+                collapsedColumnIds = [rawCollapsed];
+            }
         } catch {
             // Invalid frontmatter, proceed with defaults
         }
@@ -63,7 +71,7 @@ export function parseMarkdown(content: string): KanbanData {
     const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
     const columns = parseColumns(body, projects);
 
-    return { columns, tags, projects, doneColumnId, customViews };
+    return { columns, tags, projects, doneColumnId, customViews, collapsedColumnIds };
 }
 
 function parseColumns(body: string, projects: import("./types").KanbanProject[]): KanbanColumn[] {
@@ -84,7 +92,7 @@ function parseColumns(body: string, projects: import("./types").KanbanProject[])
         const itemMatch = line.match(/^- \[(.)\] (.+)/);
         if (itemMatch && currentColumn) {
             const rawContent = itemMatch[2]!;
-            const { content, tagIds, projectId } = extractMetadata(rawContent, projects);
+            const { content, tagIds, projectId, priority } = extractMetadata(rawContent, projects);
             let description: string | undefined;
             const descriptionLines: string[] = [];
             while (i + 1 < lines.length) {
@@ -128,6 +136,7 @@ function parseColumns(body: string, projects: import("./types").KanbanProject[])
                 description,
                 tags: tagIds,
                 project: projectId,
+                priority,
                 createdAt: Date.now(),
             });
         }
@@ -139,14 +148,25 @@ function parseColumns(body: string, projects: import("./types").KanbanProject[])
 function extractMetadata(
     rawContent: string,
     projects: import("./types").KanbanProject[]
-): { content: string; tagIds: string[]; projectId: string | undefined } {
+): { content: string; tagIds: string[]; projectId: string | undefined; priority: "low" | "medium" | "high" | "urgent" | undefined } {
     const tagIds: string[] = [];
     let projectId: string | undefined;
+    let priority: "low" | "medium" | "high" | "urgent" | undefined = undefined;
+
+    // Extract !priority token (case insensitive)
+    const priorityRegex = /!(low|medium|high|urgent)\b/gi;
+    const priorityMatch = priorityRegex.exec(rawContent);
+    if (priorityMatch) {
+        priority = priorityMatch[1]!.toLowerCase() as "low" | "medium" | "high" | "urgent";
+    }
+
+    // Strip !priority token from visible content
+    let content = rawContent.replace(/!(low|medium|high|urgent)\b/gi, "");
 
     // Extract @project token (only the first match wins)
     const projectRegex = /@([\w-]+)/g;
     let projectMatch: RegExpExecArray | null;
-    while ((projectMatch = projectRegex.exec(rawContent)) !== null) {
+    while ((projectMatch = projectRegex.exec(content)) !== null) {
         const candidate = projectMatch[1]!;
         if (projects.some((p) => p.id === candidate)) {
             projectId = candidate;
@@ -155,7 +175,7 @@ function extractMetadata(
     }
 
     // Strip @project tokens from visible content
-    let content = rawContent.replace(/@[\w-]+/g, "");
+    content = content.replace(/@[\w-]+/g, "");
 
     // Extract #tag tokens
     const tagRegex = /#([\w-]+)/g;
@@ -170,7 +190,7 @@ function extractMetadata(
     }
     content = content.replace(tagRegex, "").trim();
 
-    return { content, tagIds, projectId };
+    return { content, tagIds, projectId, priority };
 }
 
 export function serializeMarkdown(data: KanbanData): string {
@@ -197,6 +217,10 @@ export function serializeMarkdown(data: KanbanData): string {
         frontmatter[DONE_COLUMN_KEY] = data.doneColumnId;
     }
 
+    if (data.collapsedColumnIds && data.collapsedColumnIds.length > 0) {
+        frontmatter[COLLAPSED_COLUMNS_KEY] = data.collapsedColumnIds;
+    }
+
     if (data.customViews && data.customViews.length > 0) {
         frontmatter[VIEWS_KEY] = data.customViews.map((v) => ({
             id: v.id,
@@ -215,7 +239,8 @@ export function serializeMarkdown(data: KanbanData): string {
         for (const item of column.items) {
             const tagStr = item.tags.length > 0 ? " " + item.tags.map((t) => `#${t}`).join(" ") : "";
             const projStr = item.project ? ` @${item.project}` : "";
-            markdown += `- [ ] ${item.content}${tagStr}${projStr}\n`;
+            const prioStr = item.priority ? ` !${item.priority}` : "";
+            markdown += `- [ ] ${item.content}${tagStr}${projStr}${prioStr}\n`;
             if (item.description) {
                 const indentedDesc = item.description
                     .split("\n")

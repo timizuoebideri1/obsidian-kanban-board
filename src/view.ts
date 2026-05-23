@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import type { KanbanData, KanbanItem, KanbanTag, KanbanProject, KanbanCustomView } from "./types";
 import { parseMarkdown, serializeMarkdown } from "./parser";
+import type TimizuoKanbanPlugin from "./main";
 
 export const VIEW_TYPE_KANBAN = "kanban-view";
 
@@ -17,6 +18,7 @@ interface DragItemState {
 }
 
 export class KanbanView extends ItemView {
+    plugin: TimizuoKanbanPlugin;
     private data: KanbanData = { columns: [], tags: [], projects: [], doneColumnId: null };
     file: TFile | null = null;
     private saveTimeout: number | null = null;
@@ -31,12 +33,14 @@ export class KanbanView extends ItemView {
     private filterSearch = "";
     private filterTags: string[] = [];
     private filterProjects: string[] = [];
+    private filterPriorities: ("low" | "medium" | "high" | "urgent")[] = [];
     private activeCustomViewId: string | null = null;
     private columnsEl: HTMLElement | null = null;
     private pillsContainer: HTMLElement | null = null;
 
-    constructor(leaf: WorkspaceLeaf) {
+    constructor(leaf: WorkspaceLeaf, plugin: TimizuoKanbanPlugin) {
         super(leaf);
+        this.plugin = plugin;
     }
 
     getViewType(): string {
@@ -128,9 +132,19 @@ export class KanbanView extends ItemView {
     private renderColumn(parent: HTMLElement, column: import("./types").KanbanColumn): void {
         const colEl = parent.createDiv("kanban-column");
         const isDone = this.data.doneColumnId === column.id;
+        const isCollapsed = this.data.collapsedColumnIds?.includes(column.id) ?? false;
 
         if (isDone) {
             colEl.addClass("is-done-column");
+        }
+
+        if (isCollapsed) {
+            colEl.addClass("is-collapsed");
+            colEl.addEventListener("click", (e) => {
+                const target = e.target as HTMLElement;
+                if (target.closest("button") || target.closest("input") || target.closest(".kanban-item")) return;
+                this.toggleColumnCollapse(column.id);
+            });
         }
 
         // Make the column draggable
@@ -196,10 +210,16 @@ export class KanbanView extends ItemView {
         // Column header
         const colHeader = colEl.createDiv("kanban-column-header");
 
-        // Drag handle
-        const dragHandle = colHeader.createSpan({ cls: "kanban-drag-handle" });
-        setIcon(dragHandle, "grip-vertical");
-        dragHandle.setAttr("title", "Drag to reorder");
+        // Collapse toggle chevron
+        const toggleBtn = colHeader.createEl("button", {
+            cls: "kanban-icon-btn kanban-collapse-toggle clickable-icon",
+        });
+        setIcon(toggleBtn, isCollapsed ? "chevron-right" : "chevron-down");
+        toggleBtn.setAttr("title", isCollapsed ? "Expand column" : "Collapse column");
+        toggleBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.toggleColumnCollapse(column.id);
+        });
 
         if (isDone) {
             const doneIcon = colHeader.createSpan({ cls: "kanban-done-icon" });
@@ -223,10 +243,14 @@ export class KanbanView extends ItemView {
             if (this.filterProjects.length > 0) {
                 if (!item.project || !this.filterProjects.includes(item.project)) return false;
             }
+            if (this.filterPriorities.length > 0) {
+                const priority = item.priority || "low";
+                if (!this.filterPriorities.includes(priority)) return false;
+            }
             return true;
         });
 
-        const hasFilters = this.filterSearch || this.filterTags.length > 0 || this.filterProjects.length > 0;
+        const hasFilters = this.filterSearch || this.filterTags.length > 0 || this.filterProjects.length > 0 || this.filterPriorities.length > 0;
         const countBadge = colHeader.createSpan({
             text: hasFilters ? `${filteredItems.length} / ${column.items.length}` : String(column.items.length),
             cls: "kanban-column-count",
@@ -322,7 +346,7 @@ export class KanbanView extends ItemView {
         });
         addInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && addInput.value.trim()) {
-                this.addItem(column.id, addInput.value.trim());
+                void this.addItem(column.id, addInput.value.trim());
                 addInput.value = "";
             }
         });
@@ -362,11 +386,6 @@ export class KanbanView extends ItemView {
         // ── Content row ─────────────────────────────────────────────────
         const row = itemEl.createDiv("kanban-item-row");
 
-        // Drag handle for items
-        const itemDragHandle = row.createSpan({ cls: "kanban-item-drag-handle" });
-        setIcon(itemDragHandle, "grip-vertical");
-        itemDragHandle.setAttr("title", "Drag to move");
-
         // Content — click opens the sidebar, not inline edit
         const contentEl = row.createSpan({ cls: "kanban-item-content" });
         MarkdownRenderer.render(this.app, item.content, contentEl, this.file?.path ?? "", new Component());
@@ -405,6 +424,34 @@ export class KanbanView extends ItemView {
                 projBadge.style.borderColor = proj.color;
                 projBadge.style.color = proj.color;
             }
+        }
+
+        // Priority badge
+        if (item.priority) {
+            const priorityBadge = projectRow.createSpan({
+                cls: `kanban-priority-badge priority-${item.priority}`,
+                title: `Priority: ${item.priority.charAt(0).toUpperCase() + item.priority.slice(1)}`,
+            });
+            const flagIcon = priorityBadge.createSpan("kanban-priority-icon");
+            setIcon(flagIcon, "flag");
+            priorityBadge.createSpan({ text: item.priority.charAt(0).toUpperCase() + item.priority.slice(1) });
+            priorityBadge.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.showPriorityPicker(e, item);
+            });
+        }
+
+        // Add priority button (always visible on hover if no priority is set)
+        if (!item.priority) {
+            const addPriorityBtn = projectRow.createEl("button", {
+                cls: "kanban-add-priority-btn clickable-icon",
+            });
+            setIcon(addPriorityBtn, "flag");
+            addPriorityBtn.setAttr("title", "Assign priority");
+            addPriorityBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.showPriorityPicker(e, item);
+            });
         }
 
         // Add project button (always visible on hover)
@@ -549,9 +596,11 @@ export class KanbanView extends ItemView {
                     badge.style.color = proj.color;
                     const rmBtn = badge.createSpan({ cls: "kanban-tag-remove" });
                     setIcon(rmBtn, "x");
-                    rmBtn.addEventListener("click", (e) => {
+                    rmBtn.addEventListener("click", async (e) => {
                         e.stopPropagation();
                         item.project = undefined;
+                        await this.handleTaskFileMove(item);
+                        await this.updateLinkedTaskFileMetadata(item);
                         this.debouncedSave();
                         void this.render();
                         renderSidebarProject();
@@ -565,6 +614,36 @@ export class KanbanView extends ItemView {
             });
         };
         renderSidebarProject();
+
+        // ── Priority ────────────────────────────────────────────────────
+        const prioSection = panel.createDiv("kanban-sidebar-tags");
+        const prioLabel = prioSection.createDiv("kanban-sidebar-section-label");
+        prioLabel.createSpan({ text: "Priority" });
+
+        const prioRow = prioSection.createDiv("kanban-sidebar-priority-row");
+        const priorities: ("low" | "medium" | "high" | "urgent")[] = ["low", "medium", "high", "urgent"];
+        
+        const renderPriorityPills = () => {
+            prioRow.empty();
+            const currentPriority = item.priority || "low";
+            
+            for (const p of priorities) {
+                const pill = prioRow.createEl("button", {
+                    text: p.charAt(0).toUpperCase() + p.slice(1),
+                    cls: `kanban-priority-pill priority-${p} ${currentPriority === p ? "is-active" : ""}`
+                });
+                
+                pill.addEventListener("click", async () => {
+                    if (item.priority === p) return;
+                    item.priority = p;
+                    await this.updateLinkedTaskFileMetadata(item);
+                    this.debouncedSave();
+                    void this.render();
+                    renderPriorityPills();
+                });
+            }
+        };
+        renderPriorityPills();
 
         // ── Description ─────────────────────────────────────────────────
         const descSection = panel.createDiv("kanban-sidebar-desc");
@@ -670,8 +749,10 @@ export class KanbanView extends ItemView {
                 if (item.project === proj.id) {
                     opt.addClass("is-selected");
                 }
-                opt.addEventListener("click", () => {
+                opt.addEventListener("click", async () => {
                     item.project = item.project === proj.id ? undefined : proj.id;
+                    await this.handleTaskFileMove(item);
+                    await this.updateLinkedTaskFileMetadata(item);
                     this.debouncedSave();
                     picker.remove();
                     if (onPick) onPick();
@@ -684,7 +765,7 @@ export class KanbanView extends ItemView {
                     "kanban-tag-picker-option kanban-tag-picker-create"
                 );
                 createOpt.createSpan({ text: `Create project "${filter}"` });
-                createOpt.addEventListener("click", () => {
+                createOpt.addEventListener("click", async () => {
                     const newProj: KanbanProject = {
                         id: filter.toLowerCase().replace(/\s+/g, "-"),
                         name: filter,
@@ -692,6 +773,8 @@ export class KanbanView extends ItemView {
                     };
                     this.data.projects.push(newProj);
                     item.project = newProj.id;
+                    await this.handleTaskFileMove(item);
+                    await this.updateLinkedTaskFileMetadata(item);
                     this.debouncedSave();
                     picker.remove();
                     if (onPick) onPick();
@@ -714,6 +797,73 @@ export class KanbanView extends ItemView {
         picker.style.left = `${rect.left}px`;
 
         input.focus();
+
+        // Close on outside click
+        const closeHandler = (e: MouseEvent) => {
+            if (!picker.contains(e.target as Node)) {
+                picker.remove();
+                document.removeEventListener("click", closeHandler);
+            }
+        };
+        setTimeout(() => {
+            document.addEventListener("click", closeHandler);
+        }, 0);
+
+        const keyHandler = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                picker.remove();
+                document.removeEventListener("keydown", keyHandler);
+            }
+        };
+        document.addEventListener("keydown", keyHandler);
+    }
+
+    private showPriorityPicker(event: MouseEvent, item: KanbanItem, onPick?: () => void): void {
+        // Remove any existing picker
+        document.querySelector(".kanban-priority-picker")?.remove();
+
+        const picker = document.body.createDiv("kanban-priority-picker");
+        const list = picker.createDiv("kanban-tag-picker-list");
+
+        // Clear option
+        const clearOpt = list.createDiv("kanban-tag-picker-option");
+        clearOpt.createSpan({ text: "None (Clear)" });
+        if (!item.priority) {
+            clearOpt.addClass("is-selected");
+        }
+        clearOpt.addEventListener("click", async () => {
+            item.priority = undefined;
+            await this.updateLinkedTaskFileMetadata(item);
+            this.debouncedSave();
+            picker.remove();
+            if (onPick) onPick();
+            void this.render();
+        });
+
+        const priorities: ("low" | "medium" | "high" | "urgent")[] = ["low", "medium", "high", "urgent"];
+
+        for (const p of priorities) {
+            const opt = list.createDiv("kanban-tag-picker-option");
+            if (item.priority === p) {
+                opt.addClass("is-selected");
+            }
+            opt.createSpan({ text: p.charAt(0).toUpperCase() + p.slice(1) });
+            opt.addEventListener("click", async () => {
+                item.priority = p;
+                await this.updateLinkedTaskFileMetadata(item);
+                this.debouncedSave();
+                picker.remove();
+                if (onPick) onPick();
+                void this.render();
+            });
+        }
+
+        // Position picker near the button/badge
+        const target = event.target as HTMLElement;
+        const rect = target.getBoundingClientRect();
+        picker.style.position = "fixed";
+        picker.style.top = `${rect.bottom + 4}px`;
+        picker.style.left = `${rect.left}px`;
 
         // Close on outside click
         const closeHandler = (e: MouseEvent) => {
@@ -892,15 +1042,153 @@ export class KanbanView extends ItemView {
         document.addEventListener("keydown", keyHandler);
     }
 
-    private addItem(columnId: string, content: string): void {
+    private async ensureFolderExists(path: string): Promise<void> {
+        if (!path || path === "/" || path === ".") return;
+        const parts = path.split("/").filter(Boolean);
+        let currentPath = "";
+        for (const part of parts) {
+            currentPath = currentPath ? `${currentPath}/${part}` : part;
+            const abstractFile = this.app.vault.getAbstractFileByPath(currentPath);
+            if (!abstractFile) {
+                try {
+                    await this.app.vault.createFolder(currentPath);
+                } catch (e) {
+                    console.error("Failed to create folder segment:", currentPath, e);
+                }
+            }
+        }
+    }
+
+    private async handleTaskFileMove(item: KanbanItem): Promise<void> {
+        const file = this.file;
+        if (!file || !this.plugin.settings.createFolderForProjects) return;
+
+        const match = item.content.trim().match(/^\[\[([^\]|]+)(?:\|[^\]]+)?\]\]$/);
+        if (!match || !match[1]) return;
+
+        const linkPath = match[1].trim();
+        const taskFile = this.app.metadataCache.getFirstLinkpathDest(linkPath, file.path);
+        if (!taskFile) return;
+
+        const baseFolder = this.plugin.settings.baseProjectsFolder.trim() || "Kanban Projects";
+        let projectFolder = baseFolder;
+        if (item.project) {
+            const proj = this.data.projects.find((p) => p.id === item.project);
+            if (proj) {
+                projectFolder = `${baseFolder}/${proj.name}`;
+            }
+        }
+
+        await this.ensureFolderExists(projectFolder);
+
+        const destFolder = this.app.vault.getAbstractFileByPath(projectFolder);
+        if (destFolder) {
+            const newPath = `${projectFolder}/${taskFile.name}`;
+            if (taskFile.path !== newPath) {
+                try {
+                    let uniquePath = newPath;
+                    let counter = 1;
+                    const baseName = taskFile.basename;
+                    while (this.app.vault.getAbstractFileByPath(uniquePath)) {
+                        uniquePath = `${projectFolder}/${baseName} ${counter}.md`;
+                        counter++;
+                    }
+                    await this.app.fileManager.renameFile(taskFile, uniquePath);
+                    const actualFileName = uniquePath.split("/").pop()?.replace(/\.md$/, "") ?? taskFile.basename;
+                    item.content = `[[${actualFileName}]]`;
+                } catch (e) {
+                    console.error("Failed to move task file", e);
+                }
+            }
+        }
+    }
+
+    private async updateLinkedTaskFileMetadata(item: KanbanItem): Promise<void> {
+        if (!this.plugin.settings.createTaskFiles) return;
+
+        const match = item.content.trim().match(/^\[\[([^\]|]+)(?:\|[^\]]+)?\]\]$/);
+        if (!match || !match[1]) return;
+
+        const linkPath = match[1].trim();
+        const taskFile = this.app.metadataCache.getFirstLinkpathDest(linkPath, this.file?.path ?? "");
+        if (!taskFile) return;
+
+        try {
+            await this.app.fileManager.processFrontMatter(taskFile, (frontmatter) => {
+                if (item.priority) {
+                    frontmatter["priority"] = item.priority;
+                } else {
+                    delete frontmatter["priority"];
+                }
+
+                if (item.project) {
+                    const proj = this.data.projects.find((p) => p.id === item.project);
+                    frontmatter["project"] = proj ? proj.name : item.project;
+                } else {
+                    delete frontmatter["project"];
+                }
+            });
+        } catch (e) {
+            console.error("Failed to update task file frontmatter", e);
+        }
+    }
+
+    private async addItem(columnId: string, content: string): Promise<void> {
         const column = this.data.columns.find((c) => c.id === columnId);
         if (!column) return;
 
+        // Auto-assign project if exactly one project is selected in the project filters
+        let assignedProject: string | undefined = undefined;
+        if (this.filterProjects.length === 1) {
+            assignedProject = this.filterProjects[0];
+        }
+
+        let finalContent = content;
+        if (this.plugin.settings.createTaskFiles) {
+            const safeName = content.replace(/[\\/:*?"<>|]/g, "").trim();
+            if (safeName) {
+                const baseFolder = this.plugin.settings.baseProjectsFolder.trim() || "Kanban Projects";
+                let folderPath = baseFolder;
+                if (assignedProject && this.plugin.settings.createFolderForProjects) {
+                    const proj = this.data.projects.find((p) => p.id === assignedProject);
+                    if (proj) {
+                        folderPath = `${baseFolder}/${proj.name}`;
+                    }
+                }
+
+                await this.ensureFolderExists(folderPath);
+
+                const fullPath = `${folderPath}/${safeName}.md`;
+                let uniquePath = fullPath;
+                let counter = 1;
+                while (this.app.vault.getAbstractFileByPath(uniquePath)) {
+                    uniquePath = `${folderPath}/${safeName} ${counter}.md`;
+                    counter++;
+                }
+
+                try {
+                    let fmString = "---\npriority: low\n";
+                    if (assignedProject) {
+                        const proj = this.data.projects.find((p) => p.id === assignedProject);
+                        fmString += `project: ${proj ? proj.name : assignedProject}\n`;
+                    }
+                    fmString += "---\n";
+                    const fileContent = `${fmString}# ${safeName}\n\n`;
+                    await this.app.vault.create(uniquePath, fileContent);
+                    const actualFileName = uniquePath.split("/").pop()?.replace(/\.md$/, "") ?? safeName;
+                    finalContent = `[[${actualFileName}]]`;
+                } catch (e) {
+                    console.error("Failed to create task file", e);
+                }
+            }
+        }
+
         column.items.push({
             id: Math.random().toString(36).substring(2, 10),
-            content,
+            content: finalContent,
             tags: [],
-            project: undefined,
+            project: assignedProject,
+            priority: "low",
             createdAt: Date.now(),
         });
         this.debouncedSave();
@@ -920,6 +1208,19 @@ export class KanbanView extends ItemView {
 
     private deleteColumn(columnId: string): void {
         this.data.columns = this.data.columns.filter((c) => c.id !== columnId);
+        this.debouncedSave();
+        void this.render();
+    }
+
+    private toggleColumnCollapse(columnId: string): void {
+        if (!this.data.collapsedColumnIds) {
+            this.data.collapsedColumnIds = [];
+        }
+        if (this.data.collapsedColumnIds.includes(columnId)) {
+            this.data.collapsedColumnIds = this.data.collapsedColumnIds.filter((id) => id !== columnId);
+        } else {
+            this.data.collapsedColumnIds.push(columnId);
+        }
         this.debouncedSave();
         void this.render();
     }
@@ -1082,6 +1383,14 @@ export class KanbanView extends ItemView {
         projsBtn.createSpan({ text: "Projects" });
         projsBtn.addEventListener("click", (e) => this.showProjectsFilterPicker(e, projsBtn));
 
+        // Priority filter button
+        const prioBtn = filtersGroup.createEl("button", {
+            cls: "kanban-filter-btn",
+        });
+        setIcon(prioBtn, "flag");
+        prioBtn.createSpan({ text: "Priority" });
+        prioBtn.addEventListener("click", (e) => this.showPrioritiesFilterPicker(e, prioBtn));
+
         // Views dropdown (for custom views)
         const viewsBtn = filtersGroup.createEl("button", {
             cls: "kanban-filter-btn kanban-views-btn",
@@ -1099,7 +1408,10 @@ export class KanbanView extends ItemView {
         if (!this.pillsContainer) return;
         this.pillsContainer.empty();
 
-        const hasFilters = this.filterSearch || this.filterTags.length > 0 || this.filterProjects.length > 0;
+        const hasFilters = this.filterSearch || 
+                           this.filterTags.length > 0 || 
+                           this.filterProjects.length > 0 || 
+                           this.filterPriorities.length > 0;
 
         if (!hasFilters) {
             return;
@@ -1156,6 +1468,27 @@ export class KanbanView extends ItemView {
             }
         }
 
+        // Active Priority Pills
+        for (const p of this.filterPriorities) {
+            const pill = this.pillsContainer.createSpan({ cls: "kanban-filter-pill" });
+            const colorMap: Record<string, string> = {
+                low: "var(--text-muted)",
+                medium: "#e8590c",
+                high: "#e03131",
+                urgent: "#c92a2a"
+            };
+            const swatch = pill.createSpan({ cls: "kanban-tag-swatch" });
+            swatch.style.backgroundColor = colorMap[p] || "#888888";
+            pill.createSpan({ text: `Priority: ${p.charAt(0).toUpperCase() + p.slice(1)}`, cls: "kanban-filter-pill-text" });
+            const remove = pill.createSpan({ cls: "kanban-filter-pill-remove" });
+            setIcon(remove, "x");
+            remove.addEventListener("click", () => {
+                this.filterPriorities = this.filterPriorities.filter((item) => item !== p);
+                this.updateActiveFilterPills();
+                this.renderColumns();
+            });
+        }
+
         // Save view option
         const saveViewBtn = this.pillsContainer.createEl("button", {
             text: "+ Save as view",
@@ -1172,6 +1505,7 @@ export class KanbanView extends ItemView {
             this.filterSearch = "";
             this.filterTags = [];
             this.filterProjects = [];
+            this.filterPriorities = [];
             this.activeCustomViewId = null;
             const input = this.contentEl.querySelector(".kanban-filter-search-input") as HTMLInputElement;
             if (input) input.value = "";
@@ -1352,6 +1686,72 @@ export class KanbanView extends ItemView {
 
         if (this.data.projects.length === 0) {
             list.createDiv({ text: "No projects available", cls: "kanban-dropdown-empty" });
+        }
+
+        const rect = buttonEl.getBoundingClientRect();
+        dropdown.style.position = "fixed";
+        dropdown.style.top = `${rect.bottom + 4}px`;
+        dropdown.style.left = `${rect.left}px`;
+
+        const closeHandler = (e: MouseEvent) => {
+            if (!dropdown.contains(e.target as Node) && !buttonEl.contains(e.target as Node)) {
+                dropdown.remove();
+                document.removeEventListener("click", closeHandler);
+            }
+        };
+        setTimeout(() => {
+            document.addEventListener("click", closeHandler);
+        }, 0);
+    }
+
+    private showPrioritiesFilterPicker(event: MouseEvent, buttonEl: HTMLElement): void {
+        document.querySelector(".kanban-filter-dropdown")?.remove();
+
+        const dropdown = document.body.createDiv("kanban-filter-dropdown");
+        dropdown.createDiv({ text: "Filter by Priorities", cls: "kanban-dropdown-title" });
+
+        const list = dropdown.createDiv("kanban-dropdown-list");
+
+        const priorities: ("low" | "medium" | "high" | "urgent")[] = ["low", "medium", "high", "urgent"];
+        const colorMap: Record<string, string> = {
+            low: "var(--text-muted)",
+            medium: "#e8590c",
+            high: "#e03131",
+            urgent: "#c92a2a"
+        };
+
+        for (const p of priorities) {
+            const item = list.createDiv("kanban-dropdown-item");
+            const checkbox = item.createEl("input", {
+                type: "checkbox",
+                cls: "kanban-dropdown-checkbox",
+            });
+            checkbox.checked = this.filterPriorities.includes(p);
+
+            const swatch = item.createSpan("kanban-tag-swatch");
+            swatch.style.backgroundColor = colorMap[p] || "#888888";
+
+            item.createSpan({ text: p.charAt(0).toUpperCase() + p.slice(1) });
+
+            const toggle = () => {
+                if (this.filterPriorities.includes(p)) {
+                    this.filterPriorities = this.filterPriorities.filter((item) => item !== p);
+                } else {
+                    this.filterPriorities.push(p);
+                }
+                checkbox.checked = this.filterPriorities.includes(p);
+                this.updateActiveFilterPills();
+                this.renderColumns();
+            };
+
+            item.addEventListener("click", (e) => {
+                if (e.target !== checkbox) {
+                    toggle();
+                }
+            });
+            checkbox.addEventListener("change", () => {
+                toggle();
+            });
         }
 
         const rect = buttonEl.getBoundingClientRect();
