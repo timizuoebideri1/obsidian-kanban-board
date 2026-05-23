@@ -1,36 +1,40 @@
-import {App, PluginSettingTab, Setting} from "obsidian";
-import MyPlugin from "./main";
+import { App, PluginSettingTab, Setting } from "obsidian";
+import type TimizuoKanbanPlugin from "./main";
 
-export interface MyPluginSettings {
-	mySetting: string;
+export interface KanbanSettings {
+    defaultView: "kanban" | "markdown";
 }
 
-export const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+export const DEFAULT_SETTINGS: KanbanSettings = {
+    defaultView: "kanban",
+};
 
-export class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+export class KanbanSettingTab extends PluginSettingTab {
+    plugin: TimizuoKanbanPlugin;
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    constructor(app: App, plugin: TimizuoKanbanPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
 
-	display(): void {
-		const {containerEl} = this;
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
 
-		containerEl.empty();
+        containerEl.createEl("h2", { text: "Kanban Board Settings" });
 
-		new Setting(containerEl)
-			.setName('Settings #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+        new Setting(containerEl)
+            .setName("Default view")
+            .setDesc("How to open kanban markdown files by default")
+            .addDropdown((dropdown) =>
+                dropdown
+                    .addOption("kanban", "Kanban")
+                    .addOption("markdown", "Markdown")
+                    .setValue(this.plugin.settings.defaultView)
+                    .onChange(async (value) => {
+                        this.plugin.settings.defaultView = value as "kanban" | "markdown";
+                        await this.plugin.saveSettings();
+                    })
+            );
+    }
 }
